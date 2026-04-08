@@ -211,6 +211,25 @@ A full long-running monitor daemon and BLE advertisement decryption are not incl
 
 Those are good next steps, but the CLI already owns the native control-channel path itself instead of relying on LibrePods.
 
+## Systemd user service
+
+You can keep a persistent monitor running through a user service instead of spawning it from your status bar.
+
+An example unit lives at:
+
+- `contrib/systemd/airpods-monitor.service.example`
+
+Example install:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp contrib/systemd/airpods-monitor.service.example ~/.config/systemd/user/airpods-monitor.service
+systemctl --user daemon-reload
+systemctl --user enable --now airpods-monitor.service
+```
+
+Then your bar can just read the cache file written by the service.
+
 ## Development
 
 Run tests:

@@ -1,0 +1,16 @@
+[Unit]
+Description=linux-airpods-cli monitor
+Documentation=https://github.com/1jehuang/linux-airpods-cli
+After=bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+Type=simple
+Environment=AIRPODS_MAC=74:77:86:57:67:2A
+Environment=AIRPODS_CACHE_FILE=/tmp/linux-airpods-cli-74_77_86_57_67_2A.json
+ExecStart=%h/.local/bin/airpods --mac ${AIRPODS_MAC} monitor --cache-file ${AIRPODS_CACHE_FILE}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
