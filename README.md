@@ -10,6 +10,8 @@ It intentionally avoids depending on helper daemons like LibrePods. The first ve
 - active stream movement
 - transport recovery
 - status inspection
+- native AAP battery querying
+- native AirPods key retrieval
 
 ## Why
 
@@ -38,10 +40,16 @@ No third-party Python packages are required.
 
 ## Install
 
+### Install with pipx
+
+```bash
+pipx install git+https://github.com/1jehuang/linux-airpods-cli.git
+```
+
 ### Local editable install
 
 ```bash
-python -m pip install -e .
+pipx install -e .
 ```
 
 That exposes the `airpods` command.
@@ -99,6 +107,32 @@ Set the AirPods sink as the default output and move active streams to it.
 #### `airpods sink`
 Print the active AirPods sink name.
 
+#### `airpods battery`
+Query exact battery information from the AirPods over AAP.
+
+```bash
+airpods battery
+airpods battery --json
+```
+
+#### `airpods keys`
+Request Magic Cloud Keys from the AirPods over AAP.
+
+```bash
+airpods keys
+airpods keys --json
+```
+
+#### `airpods monitor`
+Run a persistent AirPods AAP monitor that writes a JSON cache file.
+
+```bash
+airpods monitor
+airpods monitor --once
+```
+
+This is useful for status bars like Waybar, where repeated one-shot control-channel connections can be less reliable than a single long-lived session.
+
 #### `airpods fix`
 Run the recovery flow that has proven useful for broken AirPods sessions:
 
@@ -145,11 +179,37 @@ This project intentionally stays close to Linux primitives:
 
 That keeps the failure surface smaller than relying on larger third-party helper services.
 
+## Native AAP support
+
+`linux-airpods-cli` now speaks the AirPods control channel itself over authenticated / encrypted classic L2CAP.
+
+That powers:
+
+- exact battery packets
+- metadata packets
+- Magic Cloud Key retrieval
+
+Examples:
+
+```bash
+airpods battery
+airpods battery --json
+airpods keys
+airpods monitor --once
+```
+
+You can also fold the AAP data into `status`:
+
+```bash
+airpods status --aap
+airpods status --aap --json
+```
+
 ## What is not implemented yet
 
-Battery reporting is not included in `v0.1.0`.
+A full long-running monitor daemon and BLE advertisement decryption are not included yet.
 
-That is deliberate. Reliable AirPods battery support on Linux usually requires Apple-specific protocol handling that is not exposed cleanly through standard BlueZ audio interfaces. A future version can add a native implementation rather than depending on an external helper daemon.
+Those are good next steps, but the CLI already owns the native control-channel path itself instead of relying on LibrePods.
 
 ## Development
 

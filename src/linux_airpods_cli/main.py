@@ -5,11 +5,17 @@ import json
 import os
 import re
 import shutil
+import struct as pystruct
 import subprocess
 import sys
+import tempfile
 import time
+import wave
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+from .aap import AAPError, AAPSession
 
 
 class AirPodsCliError(RuntimeError):
@@ -356,6 +362,19 @@ def build_status(device: Device) -> dict[str, Any]:
     }
 
 
+def default_cache_file(mac: str) -> str:
+    slug = normalize_mac_underscore(mac)
+    return str(Path("/tmp") / f"linux-airpods-cli-{slug}.json")
+
+
+def write_json_file(file_path: str, payload: dict[str, Any]) -> None:
+    Path(file_path).parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = f"{file_path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+    os.replace(tmp_path, file_path)
+
+
 def print_human_status(status: dict[str, Any]) -> None:
     print(f"Name:            {status['name']}")
     print(f"MAC:             {status['mac']}")
@@ -368,15 +387,92 @@ def print_human_status(status: dict[str, Any]) -> None:
     print(f"Sink state:      {status['sink_state'] or '-'}")
     print(f"Default sink:    {status['default_sink'] or '-'}")
     print(f"Default AirPods: {yes_no(status['default_is_airpods'])}")
+    if status.get("battery"):
+        battery = status["battery"]
+        print("Battery:")
+        for name in ("left", "right", "case", "headset"):
+            component = battery.get(name)
+            if not component:
+                continue
+            if component.get("available"):
+                level = component.get("level")
+                charging = " charging" if component.get("charging") else ""
+                print(f"  {name:<7} {level}%{charging}")
+            else:
+                print(f"  {name:<7} unavailable")
+    if status.get("metadata"):
+        metadata = status["metadata"]
+        print("Metadata:")
+        print(f"  Model number:  {metadata.get('model_number') or '-'}")
+        print(f"  Manufacturer:  {metadata.get('manufacturer') or '-'}")
+    if status.get("noise_control_mode") is not None:
+        print(f"Noise control:   {status['noise_control_mode']}")
+    if status.get("conversational_awareness_enabled") is not None:
+        print(f"CA enabled:      {yes_no(status['conversational_awareness_enabled'])}")
 
 
 def yes_no(value: bool) -> str:
     return "yes" if value else "no"
 
 
+def wake_airpods_sink(mac: str) -> bool:
+    sink = find_airpods_sink(mac)
+    if sink is None:
+        return False
+
+    sample_path = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="linux-airpods-cli-", suffix=".wav", delete=False) as handle:
+            sample_path = handle.name
+        with wave.open(sample_path, "wb") as wav_file:
+            wav_file.setnchannels(2)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(48000)
+            silence_frame = pystruct.pack("<hh", 0, 0)
+            wav_file.writeframes(silence_frame * int(48000 * 0.2))
+
+        if shutil.which("paplay"):
+            result = subprocess.run(
+                ["paplay", sample_path],
+                env={**os.environ, "PULSE_SINK": sink.name},
+                timeout=5,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return result.returncode == 0
+        if shutil.which("pw-play"):
+            result = subprocess.run(
+                ["pw-play", "--target", sink.name, sample_path],
+                timeout=5,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return result.returncode == 0
+        return False
+    except Exception:
+        return False
+    finally:
+        if sample_path and os.path.exists(sample_path):
+            try:
+                os.remove(sample_path)
+            except OSError:
+                pass
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     device = discover_device(args.mac, args.name)
     status = build_status(device)
+    if args.aap:
+        if not status["connected"]:
+            raise AirPodsCliError("AirPods are not connected, so AAP status is unavailable.")
+        try:
+            with AAPSession(device.mac, timeout_seconds=args.wait) as session:
+                aap_state = session.query(request_keys=False, capture_packets=args.raw_packets)
+        except AAPError as exc:
+            raise AirPodsCliError(str(exc)) from exc
+        status.update(aap_state.to_dict())
     if args.json:
         print(json.dumps(status, indent=2, sort_keys=True))
     else:
@@ -490,6 +586,139 @@ def cmd_fix(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_battery(args: argparse.Namespace) -> int:
+    device = discover_device(args.mac, args.name)
+    if not connected(device.mac):
+        raise AirPodsCliError("AirPods must be connected before querying AAP battery.")
+    if args.wake:
+        wake_airpods_sink(device.mac)
+    try:
+        with AAPSession(device.mac, timeout_seconds=args.wait) as session:
+            state = session.query(request_keys=False, capture_packets=args.raw_packets)
+    except AAPError as exc:
+        raise AirPodsCliError(str(exc)) from exc
+    payload = {
+        "name": device.name,
+        "mac": device.mac,
+        **state.to_dict(),
+    }
+    if state.battery is None:
+        raise AirPodsCliError("No battery packet received from the AirPods.")
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        battery = state.battery.to_dict()
+        print(f"Name: {device.name}")
+        print(f"MAC:  {device.mac}")
+        for name in ("left", "right", "case", "headset"):
+            component = battery[name]
+            if component["available"]:
+                charging = " charging" if component["charging"] else ""
+                print(f"{name.capitalize():<7} {component['level']}%{charging}")
+            else:
+                print(f"{name.capitalize():<7} unavailable")
+    return 0
+
+
+def cmd_keys(args: argparse.Namespace) -> int:
+    device = discover_device(args.mac, args.name)
+    if not connected(device.mac):
+        raise AirPodsCliError("AirPods must be connected before requesting AAP keys.")
+    if args.wake:
+        wake_airpods_sink(device.mac)
+    try:
+        with AAPSession(device.mac, timeout_seconds=args.wait) as session:
+            state = session.query(request_keys=True, capture_packets=args.raw_packets)
+    except AAPError as exc:
+        raise AirPodsCliError(str(exc)) from exc
+    if state.magic_keys is None:
+        raise AirPodsCliError("No Magic Cloud Keys packet received from the AirPods.")
+    payload = {
+        "name": device.name,
+        "mac": device.mac,
+        **state.magic_keys.to_dict(),
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(f"Name:    {device.name}")
+        print(f"MAC:     {device.mac}")
+        print(f"IRK:     {payload['irk']}")
+        print(f"Enc key: {payload['enc_key']}")
+    return 0
+
+
+def cmd_monitor(args: argparse.Namespace) -> int:
+    device = discover_device(args.mac, args.name)
+    cache_file = args.cache_file or default_cache_file(device.mac)
+
+    while True:
+        is_connected = connected(device.mac)
+        if not is_connected:
+            write_json_file(cache_file, {
+                "name": device.name,
+                "mac": device.mac,
+                "connected": False,
+                "timestamp": time.time(),
+            })
+            if args.once:
+                raise AirPodsCliError("AirPods must be connected before starting monitor.")
+            time.sleep(args.retry_interval)
+            continue
+
+        try:
+            if args.wake:
+                wake_airpods_sink(device.mac)
+            with AAPSession(device.mac, timeout_seconds=args.wait) as session:
+                state = session.query(request_keys=args.request_keys, capture_packets=args.raw_packets)
+                payload = {
+                    "name": device.name,
+                    "mac": device.mac,
+                    "connected": True,
+                    "timestamp": time.time(),
+                    **state.to_dict(),
+                }
+                write_json_file(cache_file, payload)
+                if args.once:
+                    print(json.dumps(payload, indent=2, sort_keys=True))
+                    return 0
+
+                last_notification_request = time.monotonic()
+                while True:
+                    got_packet = session.read_next(state, timeout=args.poll_interval, capture_packets=args.raw_packets)
+                    now = time.monotonic()
+                    if got_packet:
+                        payload = {
+                            "name": device.name,
+                            "mac": device.mac,
+                            "connected": True,
+                            "timestamp": time.time(),
+                            **state.to_dict(),
+                        }
+                        write_json_file(cache_file, payload)
+                    elif now - last_notification_request >= args.refresh_interval:
+                        session.request_notifications()
+                        last_notification_request = now
+                    if not connected(device.mac):
+                        break
+        except AAPError as exc:
+            write_json_file(cache_file, {
+                "name": device.name,
+                "mac": device.mac,
+                "connected": connected(device.mac),
+                "error": str(exc),
+                "timestamp": time.time(),
+            })
+            if args.once:
+                raise AirPodsCliError(str(exc)) from exc
+            time.sleep(args.retry_interval)
+            continue
+
+        if args.once:
+            return 0
+        time.sleep(args.retry_interval)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="airpods",
@@ -502,6 +731,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     status_parser = subparsers.add_parser("status", help="Show AirPods Bluetooth and audio state")
     status_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    status_parser.add_argument("--aap", action="store_true", help="Also query AAP battery / metadata over the native AirPods control channel")
+    status_parser.add_argument("--raw-packets", action="store_true", help="Include raw AAP packets when using --aap")
+    status_parser.add_argument("--wait", type=float, default=12.0, help="Seconds to wait for AAP packets")
     status_parser.set_defaults(func=cmd_status)
 
     devices_parser = subparsers.add_parser("devices", help="List AirPods-like Bluetooth devices")
@@ -571,6 +803,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fix_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     fix_parser.set_defaults(func=cmd_fix, restart_audio=True, move=True)
+
+    battery_parser = subparsers.add_parser("battery", help="Query exact AirPods battery over the native AAP control channel")
+    battery_parser.add_argument("--wait", type=float, default=12.0, help="Seconds to wait for AAP packets")
+    battery_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    battery_parser.add_argument("--raw-packets", action="store_true", help="Include raw AAP packets in the JSON output")
+    battery_parser.add_argument("--no-wake", action="store_false", dest="wake", help="Skip the silent sink wake-up before opening AAP")
+    battery_parser.set_defaults(func=cmd_battery, wake=True)
+
+    keys_parser = subparsers.add_parser("keys", help="Request AirPods Magic Cloud Keys over the native AAP control channel")
+    keys_parser.add_argument("--wait", type=float, default=12.0, help="Seconds to wait for AAP packets")
+    keys_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    keys_parser.add_argument("--raw-packets", action="store_true", help="Include raw AAP packets in the JSON output")
+    keys_parser.add_argument("--no-wake", action="store_false", dest="wake", help="Skip the silent sink wake-up before opening AAP")
+    keys_parser.set_defaults(func=cmd_keys, wake=True)
+
+    monitor_parser = subparsers.add_parser("monitor", help="Run a persistent native AAP monitor and write a local cache file")
+    monitor_parser.add_argument("--cache-file", help="Path to the JSON cache file")
+    monitor_parser.add_argument("--wait", type=float, default=12.0, help="Seconds to wait for the initial AAP setup")
+    monitor_parser.add_argument("--poll-interval", type=float, default=1.0, help="Seconds to wait for the next packet")
+    monitor_parser.add_argument("--refresh-interval", type=float, default=20.0, help="How often to re-request notifications while idle")
+    monitor_parser.add_argument("--retry-interval", type=float, default=3.0, help="Retry delay after disconnect or monitor error")
+    monitor_parser.add_argument("--request-keys", action="store_true", help="Also request Magic Cloud Keys during monitor startup")
+    monitor_parser.add_argument("--raw-packets", action="store_true", help="Store raw AAP packets in the cache file")
+    monitor_parser.add_argument("--no-wake", action="store_false", dest="wake", help="Skip the silent sink wake-up before opening AAP")
+    monitor_parser.add_argument("--once", action="store_true", help="Prime the cache once and exit")
+    monitor_parser.set_defaults(func=cmd_monitor, wake=True)
 
     return parser
 
