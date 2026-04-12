@@ -458,17 +458,35 @@ def build_status(device: Device) -> dict[str, Any]:
     }
 
 
+def state_dir() -> Path:
+    base = os.environ.get("XDG_STATE_HOME")
+    if base:
+        return Path(base) / "linux-airpods-cli"
+    return Path.home() / ".local" / "state" / "linux-airpods-cli"
+
+
 def default_cache_file(mac: str) -> str:
     slug = normalize_mac_underscore(mac)
-    return str(Path("/tmp") / f"linux-airpods-cli-{slug}.json")
+    return str(state_dir() / f"linux-airpods-cli-{slug}.json")
 
 
-def write_json_file(file_path: str, payload: dict[str, Any]) -> None:
-    Path(file_path).parent.mkdir(parents=True, exist_ok=True)
+def write_json_file(file_path: str, payload: dict[str, Any]) -> bool:
+    target_path = Path(file_path)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = f"{file_path}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle)
-    os.replace(tmp_path, file_path)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        os.replace(tmp_path, file_path)
+        return True
+    except OSError as exc:
+        print(f"warning: failed to write cache file {target_path}: {exc}", file=sys.stderr)
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return False
 
 
 def print_human_status(status: dict[str, Any]) -> None:
