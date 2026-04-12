@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import wave
+from functools import lru_cache
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -102,6 +103,97 @@ def parse_bluetooth_info(output: str) -> dict[str, str]:
     return info
 
 
+def _strip_tree_prefix(raw_line: str) -> str:
+    return re.sub(r"^[\s├└─]+", "", raw_line).strip()
+
+
+@lru_cache(maxsize=256)
+def bluez_device_path(mac: str) -> str | None:
+    if shutil.which("busctl") is None:
+        return None
+
+    slug = normalize_mac_underscore(mac)
+    result = run_command(["busctl", "--system", "tree", "org.bluez"], timeout=10)
+    if result.code != 0:
+        return None
+
+    suffix = f"/dev_{slug}"
+    for raw_line in result.stdout.splitlines():
+        path = _strip_tree_prefix(raw_line)
+        if path.endswith(suffix):
+            return path
+    return None
+
+
+def bluez_device_property(mac: str, prop: str) -> Any | None:
+    path = bluez_device_path(mac)
+    if path is None:
+        return None
+
+    result = run_command(
+        [
+            "busctl",
+            "--json=short",
+            "--system",
+            "get-property",
+            "org.bluez",
+            path,
+            "org.bluez.Device1",
+            prop,
+        ],
+        timeout=10,
+    )
+    if result.code != 0:
+        return None
+
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    return payload.get("data")
+
+
+def _stringify_bluez_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, list):
+        return " ".join(str(item) for item in value)
+    return str(value)
+
+
+def bluetooth_info_via_busctl(mac: str) -> dict[str, str]:
+    property_map = {
+        "Name": "Name",
+        "Alias": "Alias",
+        "Address": "Address",
+        "AddressType": "AddressType",
+        "Paired": "Paired",
+        "Bonded": "Bonded",
+        "Trusted": "Trusted",
+        "Blocked": "Blocked",
+        "Connected": "Connected",
+        "LegacyPairing": "LegacyPairing",
+        "CablePairing": "CablePairing",
+        "Modalias": "Modalias",
+        "PreferredBearer": "PreferredBearer",
+        "ServicesResolved": "ServicesResolved",
+    }
+
+    info: dict[str, str] = {}
+    for prop, key in property_map.items():
+        value = bluez_device_property(mac, prop)
+        if value is None:
+            continue
+        info[key] = _stringify_bluez_value(value)
+
+    if "Bonded" in info:
+        info.setdefault("BREDR.Bonded", info["Bonded"])
+    if "Connected" in info:
+        info.setdefault("BREDR.Connected", info["Connected"])
+
+    return info
+
+
 def parse_short_sinks(output: str) -> list[Sink]:
     sinks: list[Sink] = []
     for line in output.splitlines():
@@ -149,6 +241,10 @@ def bluetooth_devices() -> list[Device]:
 
 
 def bluetooth_info(mac: str) -> dict[str, str]:
+    info = bluetooth_info_via_busctl(mac)
+    if info:
+        return info
+
     result = run_command(["bluetoothctl", "info", mac], timeout=10)
     if result.code != 0:
         return {}
