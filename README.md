@@ -36,20 +36,20 @@ Optional but used by the `fix` command if present in your user session:
 - `systemctl --user`
 - running `pipewire`, `pipewire-pulse`, and `wireplumber`
 
-No third-party Python packages are required.
+No Python runtime is required.
 
 ## Install
 
-### Install with pipx
+### Install from GitHub with Cargo
 
 ```bash
-pipx install git+https://github.com/1jehuang/linux-airpods-cli.git
+cargo install --git https://github.com/1jehuang/linux-airpods-cli.git --bin airpods
 ```
 
-### Local editable install
+### Install locally
 
 ```bash
-pipx install -e .
+cargo install --path . --root ~/.local --bin airpods
 ```
 
 That exposes the `airpods` command.
@@ -235,5 +235,5 @@ Then your bar can just read the cache file written by the service.
 Run tests:
 
 ```bash
-python -m unittest discover -s tests -v
+cargo test
 ```
